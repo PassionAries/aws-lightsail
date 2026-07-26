@@ -9,6 +9,7 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
   message,
 } from 'antd'
@@ -17,11 +18,23 @@ import api, { CredentialItem, CredentialOut, getErrorMessage } from '../api/clie
 import { useAuth } from '../auth/AuthContext'
 import dayjs from 'dayjs'
 
+function tierColor(tier?: string | null): string {
+  if (!tier) return 'default'
+  const n = parseFloat(tier)
+  if (Number.isNaN(n)) return 'blue'
+  if (n >= 32) return 'purple'
+  if (n >= 20) return 'geekblue'
+  if (n >= 8) return 'green'
+  if (n >= 5) return 'cyan'
+  return 'orange'
+}
+
 export default function CredentialsPage() {
   const { refreshMe } = useAuth()
   const [items, setItems] = useState<CredentialItem[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [quotaLoadingId, setQuotaLoadingId] = useState<number | null>(null)
   const [form] = Form.useForm()
 
   const load = async () => {
@@ -40,6 +53,23 @@ export default function CredentialsPage() {
     void load()
   }, [])
 
+  const refreshQuota = async (id: number) => {
+    setQuotaLoadingId(id)
+    try {
+      const res = await api.post<CredentialItem>(`/credentials/${id}/quotas`)
+      setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...res.data } : x)))
+      if (res.data.vcpu_tier) {
+        message.success(`配额：${res.data.vcpu_tier}${res.data.vcpu_quota != null ? `（${res.data.vcpu_quota} vCPU/Region）` : ''}`)
+      } else {
+        message.warning(res.data.quota_message || '未能读取 vCPU 配额')
+      }
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    } finally {
+      setQuotaLoadingId(null)
+    }
+  }
+
   return (
     <Space direction="vertical" size="large" style={{ width: '100%' }}>
       <Typography.Title level={3} style={{ margin: 0 }}>
@@ -49,7 +79,8 @@ export default function CredentialsPage() {
       <Alert
         type="info"
         showIcon
-        message="支持绑定多组 AWS Access Key。实例列表可按凭证筛选，操作会使用对应 Key。凭证使用 ENCRYPTION_KEY 加密存储。"
+        message="支持绑定多组 AWS Access Key。可检测每组账号的 Lightsail 配额（Service Quotas：Instances = 每 Region 最大 vCPU，社区常称 5V / 8V / 32V）。"
+        description="配额按 Region 生效；默认查询 us-east-1。部分新号在 Service Quotas 中可能显示 Not available，需通过账单/支持工单提额。添加或「校验」时会自动刷新配额。"
       />
 
       <Card title={`已绑定（${items.length}）`} loading={loading}>
@@ -69,6 +100,54 @@ export default function CredentialsPage() {
               ),
             },
             { title: 'Access Key', dataIndex: 'access_key_masked' },
+            {
+              title: 'Lightsail 配额',
+              key: 'quota',
+              render: (_, row) => {
+                if (row.vcpu_tier || row.vcpu_quota != null) {
+                  const used =
+                    row.used_vcpu != null
+                      ? `已用 ${row.used_vcpu} vCPU` +
+                        (row.used_instance_count != null ? ` / ${row.used_instance_count} 台` : '')
+                      : null
+                  const remain =
+                    row.remaining_vcpu != null ? `剩余约 ${row.remaining_vcpu} vCPU` : null
+                  const tip = [
+                    row.quota_region ? `查询 Region: ${row.quota_region}` : null,
+                    row.vcpu_quota != null ? `Instances 配额: ${row.vcpu_quota} vCPU/Region` : null,
+                    row.static_ip_quota != null ? `静态 IP 配额: ${row.static_ip_quota}` : null,
+                    used,
+                    remain,
+                    row.quota_message,
+                    row.quota_checked_at
+                      ? `检测于 ${dayjs(row.quota_checked_at).format('YYYY-MM-DD HH:mm')}`
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .join('\n')
+                  return (
+                    <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{tip}</span>}>
+                      <Space size={4} wrap>
+                        <Tag color={tierColor(row.vcpu_tier)}>{row.vcpu_tier || `${row.vcpu_quota}V`}</Tag>
+                        {row.used_vcpu != null && row.vcpu_quota != null ? (
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {row.used_vcpu}/{row.vcpu_quota}
+                          </Typography.Text>
+                        ) : null}
+                      </Space>
+                    </Tooltip>
+                  )
+                }
+                if (row.quota_message) {
+                  return (
+                    <Tooltip title={row.quota_message}>
+                      <Tag>未知</Tag>
+                    </Tooltip>
+                  )
+                }
+                return <Typography.Text type="secondary">未检测</Typography.Text>
+              },
+            },
             {
               title: '最近校验',
               dataIndex: 'last_validated_at',
@@ -100,7 +179,7 @@ export default function CredentialsPage() {
                     onClick={async () => {
                       try {
                         await api.post(`/credentials/${row.id}/validate`)
-                        message.success('校验成功')
+                        message.success('校验成功（已同步配额）')
                         void load()
                       } catch (err) {
                         message.error(getErrorMessage(err))
@@ -108,6 +187,15 @@ export default function CredentialsPage() {
                     }}
                   >
                     校验
+                  </Button>
+                  <Button
+                    size="small"
+                    type="primary"
+                    ghost
+                    loading={quotaLoadingId === row.id}
+                    onClick={() => void refreshQuota(row.id)}
+                  >
+                    检测配额
                   </Button>
                   <Popconfirm
                     title="确认删除该凭证？"
@@ -144,7 +232,9 @@ export default function CredentialsPage() {
             try {
               const res = await api.post<CredentialOut>('/credentials', values)
               setItems(res.data.items || [])
-              message.success('添加成功')
+              const latest = res.data.items?.[res.data.items.length - 1]
+              const tier = latest?.vcpu_tier
+              message.success(tier ? `添加成功，配额 ${tier}` : '添加成功')
               form.resetFields()
               form.setFieldsValue({ is_default: false })
               await refreshMe()
@@ -181,7 +271,7 @@ export default function CredentialsPage() {
             <Switch />
           </Form.Item>
           <Button type="primary" htmlType="submit" loading={saving}>
-            添加并校验
+            添加并校验（含配额检测）
           </Button>
         </Form>
       </Card>

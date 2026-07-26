@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -27,6 +29,188 @@ def make_client(access_key_id: str, secret_access_key: str, region: str = "us-ea
         aws_access_key_id=access_key_id,
         aws_secret_access_key=secret_access_key,
     )
+
+
+def make_service_quotas_client(
+    access_key_id: str, secret_access_key: str, region: str = "us-east-1"
+):
+    return boto3.client(
+        "service-quotas",
+        region_name=region,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+    )
+
+
+# Lightsail Service Quotas（按 Region 生效；Instances 配额单位是 vCPU）
+# 文档: https://docs.aws.amazon.com/general/latest/gr/lightsail.html
+LIGHTSAIL_QUOTA_INSTANCES_VCPU = "L-4259AF9B"
+LIGHTSAIL_QUOTA_STATIC_IPS = "L-BBF0F260"
+
+
+def format_vcpu_tier_label(vcpu: float | int | None) -> str | None:
+    """将 vCPU 配额格式化为社区常用的 5V / 8V / 32V 标签。"""
+    if vcpu is None:
+        return None
+    try:
+        n = float(vcpu)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    if abs(n - round(n)) < 1e-6:
+        return f"{int(round(n))}V"
+    return f"{n:g}V"
+
+
+def get_lightsail_account_quotas(
+    access_key_id: str,
+    secret_access_key: str,
+    region: str = "us-east-1",
+    include_usage: bool = True,
+) -> dict[str, Any]:
+    """
+    读取账号 Lightsail 配额（主要是每 Region 最大 vCPU，即常说的 5V/8V/32V）。
+
+    使用 AWS Service Quotas API（非 Lightsail 自带 API）。
+    部分新账号/受限账号可能查不到可调整配额，此时 vcpu_quota 为 null。
+    """
+    result: dict[str, Any] = {
+        "region": region,
+        "vcpu_quota": None,
+        "vcpu_tier": None,
+        "static_ip_quota": None,
+        "used_vcpu": None,
+        "used_instance_count": None,
+        "remaining_vcpu": None,
+        "quotas": [],
+        "message": None,
+        "error": None,
+    }
+    try:
+        sq = make_service_quotas_client(access_key_id, secret_access_key, region)
+
+        def _get_quota(code: str) -> float | None:
+            try:
+                resp = sq.get_service_quota(ServiceCode="lightsail", QuotaCode=code)
+                q = resp.get("Quota") or {}
+                val = q.get("Value")
+                return float(val) if val is not None else None
+            except ClientError as exc:
+                code_name = exc.response.get("Error", {}).get("Code", "")
+                # 配额未开通 / 无权限时降级为 list 扫描
+                if code_name in {
+                    "NoSuchResourceException",
+                    "AccessDeniedException",
+                    "AccessDenied",
+                    "UnrecognizedClientException",
+                }:
+                    return None
+                raise
+
+        vcpu = _get_quota(LIGHTSAIL_QUOTA_INSTANCES_VCPU)
+        static_ips = _get_quota(LIGHTSAIL_QUOTA_STATIC_IPS)
+
+        # 若单项失败，尝试 list_service_quotas 兜底
+        if vcpu is None or static_ips is None:
+            try:
+                page_token = None
+                while True:
+                    kwargs: dict[str, Any] = {"ServiceCode": "lightsail"}
+                    if page_token:
+                        kwargs["NextToken"] = page_token
+                    resp = sq.list_service_quotas(**kwargs)
+                    for q in resp.get("Quotas", []) or []:
+                        result["quotas"].append(
+                            {
+                                "name": q.get("QuotaName"),
+                                "code": q.get("QuotaCode"),
+                                "value": q.get("Value"),
+                                "adjustable": q.get("Adjustable"),
+                                "unit": q.get("Unit"),
+                            }
+                        )
+                        qc = q.get("QuotaCode")
+                        if qc == LIGHTSAIL_QUOTA_INSTANCES_VCPU and vcpu is None and q.get("Value") is not None:
+                            vcpu = float(q["Value"])
+                        if qc == LIGHTSAIL_QUOTA_STATIC_IPS and static_ips is None and q.get("Value") is not None:
+                            static_ips = float(q["Value"])
+                    page_token = resp.get("NextToken")
+                    if not page_token:
+                        break
+            except ClientError as exc:
+                err = exc.response.get("Error", {})
+                result["error"] = f"{err.get('Code')}: {err.get('Message')}"
+                logger.warning("list_service_quotas 失败: %s", result["error"])
+
+        result["vcpu_quota"] = vcpu
+        result["vcpu_tier"] = format_vcpu_tier_label(vcpu)
+        result["static_ip_quota"] = static_ips
+
+        if vcpu is None and not result["error"]:
+            result["message"] = (
+                "未能读取 Lightsail Instances(vCPU) 配额，"
+                "Service Quotas 可能对该账号显示为 Not available，需通过账单支持工单提额。"
+            )
+        elif vcpu is not None:
+            result["message"] = (
+                f"Lightsail 每 Region 实例配额约 {result['vcpu_tier']}（{int(vcpu) if vcpu == int(vcpu) else vcpu} vCPU）。"
+                " 配额按 Region 计算；创建实例时按套餐 vCPU 占用。"
+            )
+
+        if include_usage:
+            try:
+                usage = _sum_vcpu_usage_in_region(access_key_id, secret_access_key, region)
+                result["used_vcpu"] = usage["used_vcpu"]
+                result["used_instance_count"] = usage["instance_count"]
+                if vcpu is not None:
+                    result["remaining_vcpu"] = max(0.0, float(vcpu) - float(usage["used_vcpu"]))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("统计 vCPU 用量失败: %s", exc)
+
+        return result
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _raise_from_aws(exc)
+        except LightsailError as le:
+            result["error"] = le.message
+            result["message"] = f"配额查询失败: {le.message}"
+            return result
+        result["error"] = str(exc)
+        result["message"] = f"配额查询失败: {exc}"
+        return result
+
+
+def _sum_vcpu_usage_in_region(
+    access_key_id: str, secret_access_key: str, region: str
+) -> dict[str, Any]:
+    """按当前 Region 已有实例估算占用的 vCPU（用 bundle 的 cpuCount）。"""
+    client = make_client(access_key_id, secret_access_key, region)
+    instances = _paginate_instances(client)
+    # bundle_id -> cpu
+    cpu_by_bundle: dict[str, int] = {}
+    try:
+        page_token = None
+        while True:
+            kwargs: dict[str, Any] = {}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = client.get_bundles(**kwargs)
+            for b in resp.get("bundles", []) or []:
+                bid = b.get("bundleId")
+                if bid and b.get("cpuCount") is not None:
+                    cpu_by_bundle[bid] = int(b["cpuCount"])
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception:  # noqa: BLE001
+        logger.exception("get_bundles 失败，用量按 1 vCPU/实例估算")
+
+    used = 0
+    for inst in instances:
+        bid = inst.get("bundleId") or ""
+        used += cpu_by_bundle.get(bid, 1)
+    return {"used_vcpu": used, "instance_count": len(instances)}
 
 
 def _raise_from_aws(exc: Exception) -> None:
@@ -256,6 +440,121 @@ def get_instance(
         return {}
 
 
+def _is_windows_platform(platform: str | None, blueprint_id: str | None = None) -> bool:
+    p = (platform or "").strip().upper()
+    if p in {"WINDOWS", "WIN", "WINDOWS_SERVER"}:
+        return True
+    if p in {"LINUX", "LINUX_UNIX", "UNIX"}:
+        return False
+    bp = (blueprint_id or "").lower()
+    return "windows" in bp or bp.startswith("win_")
+
+
+def _validate_instance_password(password: str, *, windows: bool) -> None:
+    if not password or len(password) < 8 or len(password) > 64:
+        raise LightsailError("自定义密码长度需为 8-64 位", code="InvalidPassword")
+    if password != password.strip() or re.search(r"[\x00-\x1f\x7f]", password):
+        raise LightsailError("自定义密码不能包含首尾空格或控制字符", code="InvalidPassword")
+    if windows and any(ch in password for ch in ['"', "'", "`"]):
+        raise LightsailError("Windows 密码请勿包含引号或反引号", code="InvalidPassword")
+
+
+def build_password_user_data(
+    password: str,
+    platform: str | None = None,
+    blueprint_id: str | None = None,
+) -> str:
+    """生成创建实例时注入的 userData，用于设置自定义登录密码。"""
+    windows = _is_windows_platform(platform, blueprint_id)
+    _validate_instance_password(password, windows=windows)
+    if windows:
+        # Lightsail Windows userData 为 PowerShell；单引号字符串内把 ' 变成 ''
+        escaped = password.replace("'", "''")
+        return (
+            f"net user Administrator '{escaped}'\n"
+            "try {\n"
+            "  $u = Get-LocalUser -Name 'Administrator' -ErrorAction SilentlyContinue\n"
+            "  if ($u -and -not $u.Enabled) { Enable-LocalUser -Name 'Administrator' }\n"
+            "} catch {}\n"
+        )
+
+    # Linux：base64 传参，避免 shell 转义问题；为常见默认用户与 root 设置密码并开启 SSH 密码登录
+    b64 = base64.b64encode(password.encode("utf-8")).decode("ascii")
+    return (
+        "#!/bin/bash\n"
+        "set +e\n"
+        f"PASS=$(printf '%s' '{b64}' | base64 -d 2>/dev/null || echo '{b64}' | base64 -d)\n"
+        'if [ -z "$PASS" ]; then\n'
+        "  exit 0\n"
+        "fi\n"
+        "for u in ubuntu admin debian ec2-user bitnami centos rocky almalinux fedora; do\n"
+        '  if id "$u" >/dev/null 2>&1; then\n'
+        '    echo "$u:$PASS" | chpasswd\n'
+        "  fi\n"
+        "done\n"
+        'echo "root:$PASS" | chpasswd\n'
+        "if [ -d /etc/ssh/sshd_config.d ]; then\n"
+        "  cat > /etc/ssh/sshd_config.d/99-custom-password-auth.conf <<'EOF'\n"
+        "PasswordAuthentication yes\n"
+        "PermitRootLogin yes\n"
+        "KbdInteractiveAuthentication yes\n"
+        "EOF\n"
+        "fi\n"
+        "if [ -f /etc/ssh/sshd_config ]; then\n"
+        "  sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config\n"
+        "  sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config\n"
+        "  sed -i 's/^#\\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config\n"
+        "  sed -i 's/^#\\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config\n"
+        "fi\n"
+        "systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || true\n"
+    )
+
+
+def open_all_instance_ports(client, instance_name: str) -> None:
+    """
+    将实例公网防火墙设为：
+    - 所有协议 / 0-65535 / 任意 IPv4 + IPv6
+    - 保留 Lightsail 浏览器 SSH(22) 与浏览器 RDP(3389)
+    """
+    port_infos = [
+        {
+            "fromPort": 0,
+            "toPort": 65535,
+            "protocol": "all",
+            "cidrs": ["0.0.0.0/0"],
+            "ipv6Cidrs": ["::/0"],
+        },
+        {
+            "fromPort": 22,
+            "toPort": 22,
+            "protocol": "tcp",
+            "cidrListAliases": ["lightsail-connect"],
+        },
+        {
+            "fromPort": 3389,
+            "toPort": 3389,
+            "protocol": "tcp",
+            "cidrListAliases": ["lightsail-connect"],
+        },
+    ]
+    try:
+        client.put_instance_public_ports(portInfos=port_infos, instanceName=instance_name)
+    except ClientError:
+        # 部分账号/镜像对 lightsail-connect 条目敏感时，降级为仅全端口开放
+        client.put_instance_public_ports(
+            portInfos=[
+                {
+                    "fromPort": 0,
+                    "toPort": 65535,
+                    "protocol": "all",
+                    "cidrs": ["0.0.0.0/0"],
+                    "ipv6Cidrs": ["::/0"],
+                }
+            ],
+            instanceName=instance_name,
+        )
+
+
 def create_instance(
     access_key_id: str,
     secret_access_key: str,
@@ -265,6 +564,9 @@ def create_instance(
     bundle_id: str,
     availability_zone: str | None = None,
     allocate_static_ip: bool = True,
+    password: str | None = None,
+    platform: str | None = None,
+    open_all_ports: bool = True,
 ) -> dict[str, Any]:
     try:
         client = make_client(access_key_id, secret_access_key, region)
@@ -275,17 +577,36 @@ def create_instance(
             azs = (match or {}).get("availability_zones") or []
             az = azs[0] if azs else f"{region}a"
 
-        client.create_instances(
-            instanceNames=[instance_name],
-            availabilityZone=az,
-            blueprintId=blueprint_id,
-            bundleId=bundle_id,
-        )
+        create_kwargs: dict[str, Any] = {
+            "instanceNames": [instance_name],
+            "availabilityZone": az,
+            "blueprintId": blueprint_id,
+            "bundleId": bundle_id,
+        }
+        if password:
+            create_kwargs["userData"] = build_password_user_data(
+                password, platform=platform, blueprint_id=blueprint_id
+            )
+
+        client.create_instances(**create_kwargs)
+
+        # 等待实例离开 pending，再配置防火墙 / 静态 IP
+        _wait_instance_not_pending(client, instance_name, timeout=120)
+
+        firewall_opened = False
+        firewall_error: str | None = None
+        if open_all_ports:
+            try:
+                open_all_instance_ports(client, instance_name)
+                firewall_opened = True
+            except Exception as exc:  # noqa: BLE001
+                # 实例已创建成功，防火墙失败不整体失败
+                firewall_error = str(exc)
+                logger.exception("开放全部端口失败: %s", instance_name)
 
         static_ip_name = None
+        static_ip_error = False
         if allocate_static_ip:
-            # 等待实例进入非 pending 后再绑定静态 IP（超时仍会尝试绑定）
-            _wait_instance_not_pending(client, instance_name, timeout=120)
             static_ip_name = f"{instance_name}-sip-{int(time.time())}"
             try:
                 client.allocate_static_ip(staticIpName=static_ip_name)
@@ -297,18 +618,25 @@ def create_instance(
                 except Exception:  # noqa: BLE001
                     logger.exception("释放孤立静态 IP 失败: %s", static_ip_name)
                 static_ip_name = None
-                # 实例已创建成功，静态 IP 失败不整体失败，提示用户可稍后换 IP
-                return {
-                    "name": instance_name,
-                    "region": region,
-                    "static_ip_name": None,
-                    "message": "实例创建成功，但自动绑定静态 IP 失败，可稍后使用「换 IP」功能",
-                }
+                static_ip_error = True
+
+        parts = ["实例创建请求已提交"]
+        if firewall_opened:
+            parts.append("已开放全部防火墙端口(0-65535)")
+        elif open_all_ports and firewall_error:
+            parts.append("开放全部端口失败，可稍后在控制台手动放行")
+        if static_ip_name:
+            parts.append("并已分配静态 IP")
+        elif allocate_static_ip and static_ip_error:
+            parts.append("自动绑定静态 IP 失败，可稍后使用「换 IP」功能")
+        if password:
+            parts.append("已注入自定义密码（首次启动后生效）")
+
         return {
             "name": instance_name,
             "region": region,
             "static_ip_name": static_ip_name,
-            "message": "实例创建请求已提交" + ("，并已分配静态 IP" if static_ip_name else ""),
+            "message": "，".join(parts) if len(parts) == 1 else parts[0] + "，" + "，".join(parts[1:]),
         }
     except LightsailError:
         raise

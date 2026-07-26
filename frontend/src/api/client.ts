@@ -57,6 +57,17 @@ export interface CredentialItem {
   is_default: boolean
   last_validated_at?: string | null
   created_at?: string | null
+  /** Lightsail 每 Region 最大 vCPU，如 20 */
+  vcpu_quota?: number | null
+  /** 社区档位标签：5V / 8V / 32V */
+  vcpu_tier?: string | null
+  static_ip_quota?: number | null
+  used_vcpu?: number | null
+  used_instance_count?: number | null
+  remaining_vcpu?: number | null
+  quota_region?: string | null
+  quota_message?: string | null
+  quota_checked_at?: string | null
 }
 
 export interface CredentialOut {

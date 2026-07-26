@@ -71,6 +71,15 @@ class AwsCredential(Base):
     account_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Lightsail Service Quotas：Instances 配额单位为 vCPU/Region（社区常称 5V/8V/32V）
+    vcpu_quota: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vcpu_tier: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    static_ip_quota: Mapped[float | None] = mapped_column(Float, nullable=True)
+    used_vcpu: Mapped[float | None] = mapped_column(Float, nullable=True)
+    used_instance_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quota_region: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    quota_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quota_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     user: Mapped[User] = relationship(back_populates="credentials")

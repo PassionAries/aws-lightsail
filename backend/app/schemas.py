@@ -68,6 +68,16 @@ class CredentialItem(BaseModel):
     is_default: bool = False
     last_validated_at: datetime | None = None
     created_at: datetime | None = None
+    # Lightsail 配额（vCPU/Region，如 5V/8V/32V）
+    vcpu_quota: float | None = None
+    vcpu_tier: str | None = None
+    static_ip_quota: float | None = None
+    used_vcpu: float | None = None
+    used_instance_count: int | None = None
+    remaining_vcpu: float | None = None
+    quota_region: str | None = None
+    quota_message: str | None = None
+    quota_checked_at: datetime | None = None
 
 
 class CredentialListOut(BaseModel):
@@ -94,6 +104,12 @@ class InstanceCreate(BaseModel):
     allocate_static_ip: bool = True
     availability_zone: str | None = None
     credential_id: int | None = None
+    # 自定义登录密码（通过 userData 注入；不落库）
+    password: str | None = Field(default=None, min_length=8, max_length=64)
+    # 可选：LINUX_UNIX / WINDOWS，用于选择注入脚本
+    platform: str | None = None
+    # 创建后开放全部防火墙端口（0-65535 / all / 任意 IPv4+IPv6）
+    open_all_ports: bool = True
 
 
 class InstanceSettingsUpdate(BaseModel):

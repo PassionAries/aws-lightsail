@@ -213,6 +213,9 @@ async def create_instance(
             body.bundle_id,
             body.availability_zone,
             body.allocate_static_ip,
+            body.password,
+            body.platform,
+            body.open_all_ports,
         )
         # 写入默认设置（含用户级 auto_stop 默认）
         setting = get_setting(db, user.id, body.region, body.instance_name, cred.id)

@@ -18,6 +18,15 @@ from app.services import lightsail as ls
 router = APIRouter(prefix="/credentials", tags=["credentials"])
 
 
+def _remaining_vcpu(cred: AwsCredential) -> float | None:
+    if cred.vcpu_quota is None or cred.used_vcpu is None:
+        return None
+    try:
+        return max(0.0, float(cred.vcpu_quota) - float(cred.used_vcpu))
+    except (TypeError, ValueError):
+        return None
+
+
 def _item(cred: AwsCredential) -> CredentialItem:
     try:
         ak = decrypt_secret(cred.access_key_id_enc)
@@ -31,7 +40,32 @@ def _item(cred: AwsCredential) -> CredentialItem:
         is_default=bool(cred.is_default),
         last_validated_at=cred.last_validated_at,
         created_at=cred.created_at,
+        vcpu_quota=cred.vcpu_quota,
+        vcpu_tier=cred.vcpu_tier,
+        static_ip_quota=cred.static_ip_quota,
+        used_vcpu=cred.used_vcpu,
+        used_instance_count=cred.used_instance_count,
+        remaining_vcpu=_remaining_vcpu(cred),
+        quota_region=cred.quota_region,
+        quota_message=cred.quota_message,
+        quota_checked_at=cred.quota_checked_at,
     )
+
+
+def _apply_quota_to_cred(cred: AwsCredential, ak: str, sk: str, region: str = "us-east-1") -> None:
+    """查询并写回 Lightsail 配额字段（失败不抛，写入 message）。"""
+    info = ls.get_lightsail_account_quotas(ak, sk, region=region, include_usage=True)
+    cred.vcpu_quota = info.get("vcpu_quota")
+    cred.vcpu_tier = info.get("vcpu_tier")
+    cred.static_ip_quota = info.get("static_ip_quota")
+    cred.used_vcpu = info.get("used_vcpu")
+    cred.used_instance_count = info.get("used_instance_count")
+    cred.quota_region = info.get("region") or region
+    msg = info.get("message")
+    if info.get("error") and not msg:
+        msg = f"配额查询失败: {info['error']}"
+    cred.quota_message = msg
+    cred.quota_checked_at = datetime.now(timezone.utc)
 
 
 def _list_out(user: User) -> CredentialOut:
@@ -68,8 +102,10 @@ def create_credential(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CredentialOut:
+    ak = body.access_key_id.strip()
+    sk = body.secret_access_key.strip()
     try:
-        ls.validate_credentials(body.access_key_id.strip(), body.secret_access_key.strip())
+        ls.validate_credentials(ak, sk)
     except ls.LightsailError as exc:
         raise HTTPException(status_code=400, detail=f"AWS 凭证校验失败: {exc.message}")
 
@@ -80,12 +116,13 @@ def create_credential(
 
     cred = AwsCredential(
         user_id=user.id,
-        access_key_id_enc=encrypt_secret(body.access_key_id.strip()),
-        secret_access_key_enc=encrypt_secret(body.secret_access_key.strip()),
+        access_key_id_enc=encrypt_secret(ak),
+        secret_access_key_enc=encrypt_secret(sk),
         account_label=body.account_label,
         is_default=make_default,
         last_validated_at=now,
     )
+    _apply_quota_to_cred(cred, ak, sk)
     db.add(cred)
     db.add(
         OperationLog(
@@ -133,6 +170,7 @@ def update_credential(
         if body.secret_access_key:
             cred.secret_access_key_enc = encrypt_secret(body.secret_access_key.strip())
         cred.last_validated_at = datetime.now(timezone.utc)
+        _apply_quota_to_cred(cred, ak, sk)
 
     if body.account_label is not None:
         cred.account_label = body.account_label
@@ -203,7 +241,42 @@ def validate_one(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc))
     cred.last_validated_at = datetime.now(timezone.utc)
+    _apply_quota_to_cred(cred, ak, sk)
     db.add(cred)
+    db.commit()
+    db.refresh(cred)
+    return _item(cred)
+
+
+@router.post("/{credential_id}/quotas", response_model=CredentialItem)
+def refresh_quotas(
+    credential_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CredentialItem:
+    """检测该账号 Lightsail 配额（vCPU 档位如 5V/8V/32V，以及静态 IP 等）。"""
+    cred = (
+        db.query(AwsCredential)
+        .filter(AwsCredential.id == credential_id, AwsCredential.user_id == user.id)
+        .first()
+    )
+    if not cred:
+        raise HTTPException(status_code=404, detail="凭证不存在")
+    try:
+        ak = decrypt_secret(cred.access_key_id_enc)
+        sk = decrypt_secret(cred.secret_access_key_enc)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"解密凭证失败: {exc}")
+    _apply_quota_to_cred(cred, ak, sk)
+    db.add(cred)
+    db.add(
+        OperationLog(
+            user_id=user.id,
+            action="refresh_quotas",
+            status="success" if cred.vcpu_quota is not None else "partial",
+            message=cred.quota_message or cred.vcpu_tier or f"credential #{credential_id}",
+        )
+    )
     db.commit()
     db.refresh(cred)
     return _item(cred)
@@ -255,8 +328,10 @@ def put_compat(
     db: Session = Depends(get_db),
 ) -> CredentialOut:
     """兼容：若无凭证则新增；若有默认凭证则更新默认那一组。"""
+    ak = body.access_key_id.strip()
+    sk = body.secret_access_key.strip()
     try:
-        ls.validate_credentials(body.access_key_id.strip(), body.secret_access_key.strip())
+        ls.validate_credentials(ak, sk)
     except ls.LightsailError as exc:
         raise HTTPException(status_code=400, detail=f"AWS 凭证校验失败: {exc.message}")
 
@@ -265,20 +340,22 @@ def put_compat(
     if default is None:
         cred = AwsCredential(
             user_id=user.id,
-            access_key_id_enc=encrypt_secret(body.access_key_id.strip()),
-            secret_access_key_enc=encrypt_secret(body.secret_access_key.strip()),
+            access_key_id_enc=encrypt_secret(ak),
+            secret_access_key_enc=encrypt_secret(sk),
             account_label=body.account_label,
             is_default=True,
             last_validated_at=now,
         )
+        _apply_quota_to_cred(cred, ak, sk)
         db.add(cred)
         action = "add_credentials"
     else:
-        default.access_key_id_enc = encrypt_secret(body.access_key_id.strip())
-        default.secret_access_key_enc = encrypt_secret(body.secret_access_key.strip())
+        default.access_key_id_enc = encrypt_secret(ak)
+        default.secret_access_key_enc = encrypt_secret(sk)
         if body.account_label is not None:
             default.account_label = body.account_label
         default.last_validated_at = now
+        _apply_quota_to_cred(default, ak, sk)
         db.add(default)
         action = "update_credentials"
     db.add(

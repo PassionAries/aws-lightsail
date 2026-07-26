@@ -75,6 +75,14 @@ def migrate_schema() -> None:
     if "aws_credentials" in tables:
         cols = _sqlite_columns("aws_credentials")
         _add_column_if_missing("aws_credentials", "is_default BOOLEAN DEFAULT 0 NOT NULL")
+        _add_column_if_missing("aws_credentials", "vcpu_quota FLOAT")
+        _add_column_if_missing("aws_credentials", "vcpu_tier VARCHAR(32)")
+        _add_column_if_missing("aws_credentials", "static_ip_quota FLOAT")
+        _add_column_if_missing("aws_credentials", "used_vcpu FLOAT")
+        _add_column_if_missing("aws_credentials", "used_instance_count INTEGER")
+        _add_column_if_missing("aws_credentials", "quota_region VARCHAR(32)")
+        _add_column_if_missing("aws_credentials", "quota_message TEXT")
+        _add_column_if_missing("aws_credentials", "quota_checked_at DATETIME")
         # 检测旧 unique(user_id)：通过索引名粗判，或直接尝试插入逻辑依赖 is_default
         # 若缺少多 Key 支持所需结构，重建表并迁移数据
         with engine.begin() as conn:

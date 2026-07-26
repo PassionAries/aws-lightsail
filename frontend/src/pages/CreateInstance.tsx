@@ -49,6 +49,7 @@ export default function CreateInstancePage() {
   const [blueprints, setBlueprints] = useState<Blueprint[]>([])
   const [loadingMeta, setLoadingMeta] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [selectedPlatform, setSelectedPlatform] = useState<string | undefined>()
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -85,7 +86,8 @@ export default function CreateInstancePage() {
 
   const loadCatalog = async (region: string, credentialId: number) => {
     setLoadingMeta(true)
-    form.setFieldsValue({ blueprint_id: undefined, bundle_id: undefined })
+    form.setFieldsValue({ blueprint_id: undefined, bundle_id: undefined, password: undefined, password_confirm: undefined })
+    setSelectedPlatform(undefined)
     try {
       const [bRes, pRes] = await Promise.all([
         api.get<Bundle[]>('/catalog/bundles', { params: { region, credential_id: credentialId } }),
@@ -132,11 +134,15 @@ export default function CreateInstancePage() {
         <Form
           form={form}
           layout="vertical"
-          initialValues={{ allocate_static_ip: true }}
+          initialValues={{ allocate_static_ip: true, open_all_ports: true }}
           onFinish={async (values) => {
             setSubmitting(true)
             try {
-              const res = await api.post('/instances', values, { timeout: 300000 })
+              const { password_confirm: _confirm, ...payload } = values
+              if (selectedPlatform) payload.platform = selectedPlatform
+              // 未填写时不要传 password 字段，让后端走默认行为
+              if (!payload.password) delete payload.password
+              const res = await api.post('/instances', payload, { timeout: 300000 })
               message.success(res.data.message || '创建请求已提交')
               navigate('/instances')
             } catch (err) {
@@ -204,6 +210,10 @@ export default function CreateInstancePage() {
                 value: b.blueprint_id,
                 label: blueprintLabel(b),
               }))}
+              onChange={(v) => {
+                const bp = blueprints.find((b) => b.blueprint_id === v)
+                setSelectedPlatform(bp?.platform)
+              }}
             />
           </Form.Item>
 
@@ -220,6 +230,57 @@ export default function CreateInstancePage() {
                 } GB · 流量 ${b.transfer_per_month_in_gb ?? '?'} GB`,
               }))}
             />
+          </Form.Item>
+
+          <Form.Item
+            name="password"
+            label="自定义密码"
+            extra={
+              selectedPlatform && selectedPlatform.toUpperCase().includes('WIN')
+                ? '可选。将设置 Windows Administrator 密码，实例首次启动后生效。'
+                : '可选。将为 root 与常见默认用户设置登录密码，并开启 SSH 密码认证；首次启动后生效。'
+            }
+            rules={[
+              {
+                validator: async (_, value) => {
+                  if (!value) return
+                  if (String(value).length < 8 || String(value).length > 64) {
+                    throw new Error('密码长度需为 8-64 位')
+                  }
+                  if (String(value) !== String(value).trim()) {
+                    throw new Error('密码不能包含首尾空格')
+                  }
+                },
+              },
+            ]}
+          >
+            <Input.Password placeholder="留空则使用系统默认（密钥/随机密码）" autoComplete="new-password" />
+          </Form.Item>
+
+          <Form.Item
+            name="password_confirm"
+            label="确认密码"
+            dependencies={["password"]}
+            rules={[
+              ({ getFieldValue }) => ({
+                validator: async (_, value) => {
+                  const pwd = getFieldValue('password')
+                  if (!pwd && !value) return
+                  if (pwd && !value) throw new Error('请再次输入密码')
+                  if (pwd !== value) throw new Error('两次输入的密码不一致')
+                },
+              }),
+            ]}
+          >
+            <Input.Password placeholder="再次输入自定义密码" autoComplete="new-password" />
+          </Form.Item>
+          <Form.Item
+            name="open_all_ports"
+            label="开放全部防火墙端口"
+            valuePropName="checked"
+            extra="默认开启。创建后自动放行所有协议 0-65535（任意 IPv4/IPv6），并保留 Lightsail 浏览器 SSH/RDP。"
+          >
+            <Switch />
           </Form.Item>
 
           <Form.Item
